@@ -8,7 +8,8 @@ require_once __DIR__ . '/../config/db.php';   // provides $pdo
 
 function db_user_find_by_username(string $username): ?array {
   global $pdo;
-  $stmt = $pdo->prepare("SELECT id, username, role FROM users WHERE username = ? LIMIT 1");
+  // include password_hash so login can verify credentials
+  $stmt = $pdo->prepare("SELECT id, username, role, password_hash FROM users WHERE username = ? LIMIT 1");
   $stmt->execute([$username]);
   $row = $stmt->fetch();
   return $row ?: null;
@@ -56,7 +57,7 @@ function db_book_find(int $id): ?array {
 }
 
 /* =========================
-   PUBLISHERS (DB) - read only for now
+   PUBLISHERS (DB)
    ========================= */
 
 function db_publishers_list(): array {
@@ -72,83 +73,79 @@ function db_publisher_find(int $id): ?array {
   $row = $stmt->fetch();
   return $row ?: null;
 }
-
 /* =========================
    ORDERS (DB)
    ========================= */
 
-function db_order_create(string $username, array $cart): array {
+function db_order_create(int $userId, array $cart): array {
   global $pdo;
 
-  $user = db_user_find_by_username($username);
-  if (!$user) return ['ok'=>false, 'message'=>'User not found.'];
+  if ($userId <= 0) return ['ok'=>false, 'message'=>'Invalid user.'];
+  if (!$cart || count($cart) === 0) return ['ok'=>false, 'message'=>'Cart is empty.'];
 
-  // Build items from DB and validate stock
-  $items = [];
-  $total = 0;
-
-  foreach ($cart as $bookId => $qty) {
-    $bookId = (int)$bookId;
-    $qty = (int)$qty;
-    if ($qty < 1) $qty = 1;
-
-    $book = db_book_find($bookId);
-    if (!$book) continue;
-
-    $stock = (int)$book['stock'];
-    if ($stock <= 0) continue;
-
-    if ($qty > $stock) $qty = $stock;
-
-    $unit = (int)$book['price'];
-    $sub = $unit * $qty;
-
-    $items[] = [
-      'book_id' => $bookId,
-      'title' => $book['title'],
-      'qty' => $qty,
-      'unit_price' => $unit,
-      'subtotal' => $sub
-    ];
-    $total += $sub;
-  }
-
-  if (count($items) === 0) {
-    return ['ok'=>false, 'message'=>'Your cart is empty or items are unavailable.'];
-  }
-
-  // Transaction: insert order -> insert items -> update stock
   try {
     $pdo->beginTransaction();
 
-    // Create order
+    // 1) Recalculate from DB + validate stock
+    $items = [];
+    $total = 0;
+
+    foreach ($cart as $bookId => $qty) {
+      $bookId = (int)$bookId;
+      $qty = (int)$qty;
+      if ($qty < 1) $qty = 1;
+
+      // lock row for safe stock update
+      $stmt = $pdo->prepare("SELECT id, price, stock FROM books WHERE id = ? FOR UPDATE");
+      $stmt->execute([$bookId]);
+      $book = $stmt->fetch();
+
+      if (!$book) continue;
+
+      $stock = (int)$book['stock'];
+      if ($stock <= 0) continue;
+
+      if ($qty > $stock) $qty = $stock;
+
+      $unit = (int)$book['price'];
+      $sub = $unit * $qty;
+
+      $total += $sub;
+      $items[] = [
+        'book_id'=>$bookId,
+        'qty'=>$qty,
+        'unit_price'=>$unit,
+        'subtotal'=>$sub,
+        'stock'=>$stock
+      ];
+    }
+
+    if (count($items) === 0) {
+      $pdo->rollBack();
+      return ['ok'=>false, 'message'=>'No available items to order.'];
+    }
+
+    // 2) Insert order
     $stmt = $pdo->prepare("INSERT INTO orders (user_id, total) VALUES (?, ?)");
-    $stmt->execute([(int)$user['id'], $total]);
+    $stmt->execute([$userId, $total]);
     $orderId = (int)$pdo->lastInsertId();
 
-    // Insert items + update stock
-    $itemStmt = $pdo->prepare("
-      INSERT INTO order_items (order_id, book_id, qty, unit_price, subtotal)
-      VALUES (?, ?, ?, ?, ?)
-    ");
-
-    $stockStmt = $pdo->prepare("
-      UPDATE books
-      SET stock = stock - ?
-      WHERE id = ? AND stock >= ?
-    ");
+    // 3) Insert order_items + update stock
+    $ins = $pdo->prepare(
+      "INSERT INTO order_items (order_id, book_id, qty, unit_price, subtotal)
+       VALUES (?, ?, ?, ?, ?)"
+    );
+    $upd = $pdo->prepare("UPDATE books SET stock = stock - ? WHERE id = ?");
 
     foreach ($items as $it) {
-      // Decrease stock safely
-      $stockStmt->execute([$it['qty'], $it['book_id'], $it['qty']]);
-      if ($stockStmt->rowCount() !== 1) {
-        // Another order consumed stock OR invalid qty
-        $pdo->rollBack();
-        return ['ok'=>false, 'message'=>'Stock changed. Please refresh and try again.'];
-      }
-
-      // Insert order item
-      $itemStmt->execute([$orderId, $it['book_id'], $it['qty'], $it['unit_price'], $it['subtotal']]);
+      $ins->execute([
+        $orderId,
+        $it['book_id'],
+        $it['qty'],
+        $it['unit_price'],
+        $it['subtotal']
+      ]);
+      $upd->execute([$it['qty'], $it['book_id']]);
     }
 
     $pdo->commit();
@@ -190,21 +187,97 @@ function db_order_items(int $orderId): array {
   $stmt->execute([$orderId]);
   return $stmt->fetchAll();
 }
-
 /* =========================
    ADMIN - BOOKS (DB)
    ========================= */
 
+function db_book_create(
+  string $isbn,
+  string $title,
+  string $authors,
+  string $category,
+  int $publishedYear,
+  int $price,
+  int $stock,
+  int $publisherId
+): array {
+  global $pdo;
+
+  // Allowed categories
+  $ALLOWED_CATEGORIES = ['Science', 'History', 'Geography', 'Art', 'Novel'];
+
+  $isbn = trim($isbn);
+  $title = trim($title);
+  $authors = trim($authors);
+  $category = trim($category);
+
+  if ($isbn === '' || $title === '' || $authors === '' || $category === '') {
+    return ['ok'=>false, 'message'=>'All fields are required.'];
+  }
+
+  if (!in_array($category, $ALLOWED_CATEGORIES, true)) {
+    return ['ok'=>false, 'message'=>'Invalid category.'];
+  }
+
+  $isbnDigits = preg_replace('/\D+/', '', $isbn);
+  if ($isbnDigits !== $isbn || (strlen($isbn) !== 10 && strlen($isbn) !== 13)) {
+    return ['ok'=>false, 'message'=>'ISBN must be 10 or 13 digits.'];
+  }
+
+  $currentYear = (int)date('Y');
+  if ($publishedYear < 1900 || $publishedYear > $currentYear) {
+    return ['ok'=>false, 'message'=>'Invalid published year.'];
+  }
+
+  if ($price <= 0) return ['ok'=>false, 'message'=>'Price must be greater than 0.'];
+  if ($stock < 0) return ['ok'=>false, 'message'=>'Stock cannot be negative.'];
+  if ($publisherId <= 0) return ['ok'=>false, 'message'=>'Publisher is required.'];
+
+  $chkPub = $pdo->prepare("SELECT id FROM publishers WHERE id = ? LIMIT 1");
+  $chkPub->execute([$publisherId]);
+  if (!$chkPub->fetch()) {
+    return ['ok'=>false, 'message'=>'Publisher not found.'];
+  }
+
+  $chk = $pdo->prepare("SELECT id FROM books WHERE isbn = ? LIMIT 1");
+  $chk->execute([$isbn]);
+  if ($chk->fetch()) {
+    return ['ok'=>false, 'message'=>'ISBN already exists.'];
+  }
+
+  $stmt = $pdo->prepare("
+    INSERT INTO books
+      (isbn, title, authors, category, published_year, price, stock, publisher_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  ");
+  $stmt->execute([
+    $isbn,
+    $title,
+    $authors,
+    $category,
+    $publishedYear,
+    $price,
+    $stock,
+    $publisherId
+  ]);
+
+  return ['ok'=>true];
+}
+
 function db_book_update(int $id, int $price, int $stock): array {
   global $pdo;
 
-  if ($price < 0) $price = 0;
-  if ($stock < 0) $stock = 0;
+  if ($id <= 0) return ['ok'=>false, 'message'=>'Invalid book id.'];
+  if ($price < 1) return ['ok'=>false, 'message'=>'Price must be >= 1.'];
+  if ($stock < 0) return ['ok'=>false, 'message'=>'Stock cannot be negative.'];
 
-  $stmt = $pdo->prepare("UPDATE books SET price = ?, stock = ? WHERE id = ? LIMIT 1");
-  $stmt->execute([$price, $stock, $id]);
-
-  return ['ok' => ($stmt->rowCount() >= 0)];
+  try {
+    $stmt = $pdo->prepare("UPDATE books SET price = ?, stock = ? WHERE id = ? LIMIT 1");
+    $stmt->execute([$price, $stock, $id]);
+    return ['ok'=>true];
+  } catch (PDOException $e) {
+    return ['ok'=>false, 'message'=>$e->getMessage()];
+  }
 }
 /* =========================
    ADMIN - PUBLISHERS (DB)
@@ -219,7 +292,6 @@ function db_publisher_create(string $name, string $phone, string $address): arra
 
   if ($name === '') return ['ok'=>false, 'message'=>'Publisher name is required.'];
 
-  // Unique name check
   $chk = $pdo->prepare("SELECT id FROM publishers WHERE name = ? LIMIT 1");
   $chk->execute([$name]);
   if ($chk->fetch()) return ['ok'=>false, 'message'=>'Publisher already exists.'];
@@ -240,7 +312,6 @@ function db_publisher_update(int $id, string $name, string $phone, string $addre
   if ($id <= 0) return ['ok'=>false, 'message'=>'Invalid publisher id.'];
   if ($name === '') return ['ok'=>false, 'message'=>'Publisher name is required.'];
 
-  // Unique name check (excluding current)
   $chk = $pdo->prepare("SELECT id FROM publishers WHERE name = ? AND id <> ? LIMIT 1");
   $chk->execute([$name, $id]);
   if ($chk->fetch()) return ['ok'=>false, 'message'=>'Publisher name already used.'];
@@ -250,6 +321,7 @@ function db_publisher_update(int $id, string $name, string $phone, string $addre
 
   return ['ok'=>true];
 }
+
 /* =========================
    ADMIN - REPLENISHMENTS (DB)
    ========================= */
@@ -276,7 +348,6 @@ function db_replenishment_create(int $bookId, int $qty): array {
   if ($bookId <= 0) return ['ok'=>false, 'message'=>'Invalid book.'];
   if ($qty <= 0) return ['ok'=>false, 'message'=>'Quantity must be > 0.'];
 
-  // ensure book exists
   $chk = $pdo->prepare("SELECT id FROM books WHERE id = ? LIMIT 1");
   $chk->execute([$bookId]);
   if (!$chk->fetch()) return ['ok'=>false, 'message'=>'Book not found.'];
@@ -295,7 +366,6 @@ function db_replenishment_confirm(int $replId): array {
   try {
     $pdo->beginTransaction();
 
-    // lock row
     $stmt = $pdo->prepare("SELECT id, book_id, qty, status FROM replenishments WHERE id = ? FOR UPDATE");
     $stmt->execute([$replId]);
     $r = $stmt->fetch();
@@ -313,11 +383,9 @@ function db_replenishment_confirm(int $replId): array {
     $bookId = (int)$r['book_id'];
     $qty = (int)$r['qty'];
 
-    // increase stock
     $upd = $pdo->prepare("UPDATE books SET stock = stock + ? WHERE id = ? LIMIT 1");
     $upd->execute([$qty, $bookId]);
 
-    // mark confirmed
     $upd2 = $pdo->prepare("UPDATE replenishments SET status='Confirmed', confirmed_at=NOW() WHERE id = ? LIMIT 1");
     $upd2->execute([$replId]);
 
@@ -385,6 +453,91 @@ function db_report_low_stock(int $threshold = 2): array {
   return $stmt->fetchAll();
 }
 
+function db_report_sales_previous_month(): array {
+  global $pdo;
+
+  $sql = "
+    SELECT COALESCE(SUM(total), 0) AS total_sales
+    FROM orders
+    WHERE created_at >= DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m-01')
+      AND created_at <  DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')
+  ";
+  return $pdo->query($sql)->fetch();
+}
+
+function db_report_sales_on_date(string $date): array {
+  global $pdo;
+
+  $stmt = $pdo->prepare("
+    SELECT COALESCE(SUM(total), 0) AS total_sales
+    FROM orders
+    WHERE DATE(created_at) = ?
+  ");
+  $stmt->execute([$date]);
+  return $stmt->fetch();
+}
+
+function db_report_top_customers_last_3_months(int $limit = 5): array {
+  global $pdo;
+
+  $stmt = $pdo->prepare("
+    SELECT
+      u.id,
+      u.username,
+      u.full_name,
+      COALESCE(SUM(o.total), 0) AS total_spent,
+      COUNT(o.id) AS orders_count
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.created_at >= (NOW() - INTERVAL 3 MONTH)
+    GROUP BY u.id, u.username, u.full_name
+    ORDER BY total_spent DESC
+    LIMIT $limit
+  ");
+  $stmt->execute();
+  return $stmt->fetchAll();
+}
+
+function db_report_top_selling_books_last_3_months(int $limit = 10): array {
+  global $pdo;
+
+  $stmt = $pdo->prepare("
+    SELECT
+      b.id,
+      b.title,
+      b.isbn,
+      COALESCE(SUM(oi.qty), 0) AS sold_qty,
+      COALESCE(SUM(oi.subtotal), 0) AS sold_value
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    JOIN books b ON b.id = oi.book_id
+    WHERE o.created_at >= (NOW() - INTERVAL 3 MONTH)
+    GROUP BY b.id, b.title, b.isbn
+    ORDER BY sold_qty DESC
+    LIMIT $limit
+  ");
+  $stmt->execute();
+  return $stmt->fetchAll();
+}
+
+function db_report_replenishment_count_for_book(int $bookId): array {
+  global $pdo;
+
+  $stmt = $pdo->prepare("
+    SELECT
+      COUNT(*) AS times_ordered,
+      COALESCE(SUM(qty), 0) AS total_qty,
+      SUM(CASE WHEN status='Pending' THEN 1 ELSE 0 END) AS pending_count,
+      SUM(CASE WHEN status='Confirmed' THEN 1 ELSE 0 END) AS confirmed_count
+    FROM replenishments
+    WHERE book_id = ?
+  ");
+  $stmt->execute([$bookId]);
+  return $stmt->fetch();
+}
+
+
+
 function db_report_recent_orders(int $limit = 10): array {
   global $pdo;
 
@@ -402,3 +555,43 @@ function db_report_recent_orders(int $limit = 10): array {
   $stmt->execute();
   return $stmt->fetchAll();
 }
+
+/* =========================
+   USERS - CREATE
+   ========================= */
+
+function db_user_create(
+  string $username,
+  string $password,
+  string $fullName = '',
+  string $email = '',
+  string $role = 'customer'
+): array {
+  global $pdo;
+
+  $username = trim($username);
+  $fullName = trim($fullName);
+  $email    = trim($email);
+
+  if ($username === '' || $password === '') {
+    return ['ok'=>false, 'message'=>'Username and password are required.'];
+  }
+
+  $chk = $pdo->prepare("SELECT id FROM users WHERE username = ? LIMIT 1");
+  $chk->execute([$username]);
+  if ($chk->fetch()) {
+    return ['ok'=>false, 'message'=>'Username already exists.'];
+  }
+
+  $hash = password_hash($password, PASSWORD_DEFAULT);
+
+  $stmt = $pdo->prepare(
+    "INSERT INTO users (username, password_hash, full_name, email, role)
+     VALUES (?, ?, ?, ?, ?)"
+  );
+  $stmt->execute([$username, $hash, $fullName, $email, $role]);
+
+  return ['ok'=>true];
+}
+
+

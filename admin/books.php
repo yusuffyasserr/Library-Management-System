@@ -8,13 +8,27 @@ $books = db_books_list();
 
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
+
+$added = isset($_GET['added']);
 ?>
 
 <div class="container">
   <div class="hero">
     <h1>Manage Books</h1>
     <p>Update book price and stock (saved in MySQL).</p>
+
+    <!-- ✅ Add Book Button -->
+    <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+      <a class="btn" href="book_create.php">+ Add Book</a>
+      <a class="btn secondary" href="dashboard.php">Back to Dashboard</a>
+    </div>
   </div>
+
+  <?php if ($added): ?>
+    <div class="card" style="margin-top:18px; border-color: rgba(64,243,154,.35); background: rgba(64,243,154,.08);">
+      <b>Book added successfully.</b>
+    </div>
+  <?php endif; ?>
 
   <?php if ($flash): ?>
     <div class="card" style="margin-top:18px; border-color: rgba(64,243,154,.35); background: rgba(64,243,154,.08);">
@@ -68,10 +82,6 @@ unset($_SESSION['flash']);
         <?php endforeach; ?>
       </tbody>
     </table>
-  </div>
-
-  <div style="margin-top:12px;">
-    <a class="btn secondary" href="dashboard.php">Back to Dashboard</a>
   </div>
 </div>
 

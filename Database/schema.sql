@@ -97,3 +97,46 @@ CREATE TABLE IF NOT EXISTS replenishments (
     ON UPDATE CASCADE
     ON DELETE RESTRICT
 );
+
+/* =========
+   TRIGGERS 
+   ========= */
+
+-- (2.c) Prevent stock from becoming negative (BEFORE UPDATE)
+DELIMITER $$
+
+DROP TRIGGER IF EXISTS prevent_negative_stock $$
+CREATE TRIGGER prevent_negative_stock
+BEFORE UPDATE ON books
+FOR EACH ROW
+BEGIN
+  -- if admin tries to set stock negative OR checkout update causes negative
+  IF NEW.stock < 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Stock cannot be negative';
+  END IF;
+END $$
+
+DELIMITER ;
+
+
+-- (3.a) Auto replenishment order when stock drops below threshold (AFTER UPDATE)
+-- Constant quantity in trigger logic (3.b)
+DELIMITER $$
+
+DROP TRIGGER IF EXISTS auto_replenish_on_low_stock $$
+CREATE TRIGGER auto_replenish_on_low_stock
+AFTER UPDATE ON books
+FOR EACH ROW
+BEGIN
+  DECLARE threshold INT DEFAULT 2;       -- minimum stock threshold
+  DECLARE replenish_qty INT DEFAULT 5;   -- constant quantity (fixed)
+
+  -- condition: drops from ABOVE threshold to BELOW/AT threshold
+  IF OLD.stock > threshold AND NEW.stock <= threshold THEN
+    INSERT INTO replenishments (book_id, qty, status, created_at)
+    VALUES (NEW.id, replenish_qty, 'Pending', NOW());
+  END IF;
+END $$
+
+DELIMITER ;

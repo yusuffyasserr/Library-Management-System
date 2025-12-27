@@ -1,5 +1,4 @@
 <?php
-
 $DB_HOST = 'localhost';
 $DB_NAME = 'bookstore_db';
 $DB_USER = 'root';      // default for XAMPP

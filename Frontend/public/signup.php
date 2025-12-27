@@ -1,72 +1,70 @@
 <?php
-if (session_status() === PHP_SESSION_NONE) session_start();
-require_once __DIR__ . '/../includes/header.php';
+require_once __DIR__ . '/../../Backend/data/repo_db.php';
+session_start();
 
-$error = '';
-$success = '';
+$err = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  $username = trim($_POST['username'] ?? '');
-  $password = trim($_POST['password'] ?? '');
-  $name     = trim($_POST['name'] ?? '');
-  $email    = trim($_POST['email'] ?? '');
+  $username = $_POST['username'] ?? '';
+  $password = $_POST['password'] ?? '';
+  $fullName = $_POST['full_name'] ?? '';
+  $email    = $_POST['email'] ?? '';
 
-  if ($username === '' || $password === '' || $name === '' || $email === '') {
-    $error = 'Please fill all fields.';
+  // create as 'customer' to match DB enum ('customer'|'admin')
+  $res = db_user_create($username, $password, $fullName, $email, 'customer');
+
+  if ($res['ok']) {
+    // fetch created user and store username+role in session
+    $dbu = db_user_find_by_username(trim($username));
+    $role = $dbu['role'] ?? 'customer';
+    $_SESSION['user'] = ['username' => trim($username), 'role' => $role];
+    header("Location: index.php");
+    exit;
   } else {
-    // For now: just auto-login as customer
-    $_SESSION['user'] = [
-      'username' => $username,
-      'role' => 'customer',
-      'name' => $name
-    ];
-    $success = 'Account created successfully. You are now logged in.';
+    $err = $res['message'] ?? 'Signup failed.';
   }
 }
+
+require_once __DIR__ . '/../includes/header.php';
 ?>
 
-<div class="hero">
-  <h1>Sign Up</h1>
-  <p>Create a customer account to checkout and view orders.</p>
-</div>
+<div class="container">
+  <div class="hero">
+    <h1>Sign Up</h1>
+    <p>Create an account to checkout and view orders.</p>
+  </div>
 
-<div class="card" style="margin-top:18px; max-width:520px;">
-  <?php if ($error): ?>
-    <div class="card" style="border-color: rgba(255,92,122,.35); background: rgba(255,92,122,.08); margin-bottom:12px;">
-      <b><?= htmlspecialchars($error) ?></b>
+  <?php if ($err): ?>
+    <div class="card" style="margin-top:18px; border-color: rgba(255,92,122,.35); background: rgba(255,92,122,.08);">
+      <b><?= htmlspecialchars($err) ?></b>
     </div>
   <?php endif; ?>
 
-  <?php if ($success): ?>
-    <div class="card" style="border-color: rgba(64,243,154,.35); background: rgba(64,243,154,.08); margin-bottom:12px;">
-      <b><?= htmlspecialchars($success) ?></b>
-    </div>
-    <a class="btn" href="index.php">Go to Browse</a>
-  <?php else: ?>
-
-    <form method="post" class="form">
+  <div class="card" style="margin-top:18px; max-width:520px;">
+    <form class="form" method="post">
       <div>
-        <label>Full Name</label>
-        <input class="input" name="name" required>
-      </div>
-      <div>
-        <label>Email</label>
-        <input class="input" name="email" type="email" required>
-      </div>
-      <div>
-        <label>Username</label>
+        <div class="small">Username</div>
         <input class="input" name="username" required>
       </div>
+
       <div>
-        <label>Password</label>
-        <input class="input" name="password" type="password" required>
+        <div class="small">Password</div>
+        <input class="input" type="password" name="password" required>
       </div>
 
-      <button class="btn" type="submit">Create Account</button>
-      <a class="btn secondary" href="login.php">Back to Login</a>
-    </form>
+      <div>
+        <div class="small">Full Name (optional)</div>
+        <input class="input" name="full_name">
+      </div>
 
-  <?php endif; ?>
+      <div>
+        <div class="small">Email (optional)</div>
+        <input class="input" name="email">
+      </div>
+
+      <button class="btn" type="submit" style="margin-top:10px;">Create Account</button>
+    </form>
+  </div>
 </div>
 
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>
